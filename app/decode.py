@@ -67,9 +67,9 @@ def main(argv: list[str] | None = None) -> int:
         with open(args.original, "rb") as handle:
             readings = transfer.parse_readings(handle.read())
         try:
-            summary = transfer.verify_package(
-                blob, readings.values, lower, upper, decoded["eps"]
-            )
+            # Same decoded values as printed above — the package is decoded
+            # once and both the listing and the check use that batch.
+            summary = transfer.verify_decoded_values(decoded, readings.values)
         except transfer.InputError as exc:
             print(f"error: verification failed: {exc}", file=sys.stderr)
             return 1

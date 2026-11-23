@@ -25,9 +25,11 @@ information.  See FORMAT.md for the full specification.
 
 from __future__ import annotations
 
+import array
 import struct
+import sys
 import zlib
-from typing import List, Sequence
+from typing import Sequence
 
 MAGIC = b"TGPA"
 VERSION = 1
@@ -149,7 +151,7 @@ def encode_payload(codec: int, values: Sequence[int]) -> bytes:
     raise PackError(f"unknown codec {codec}")
 
 
-def _bounded_inflate(payload: bytes, expected: int) -> bytes:
+def _bounded_inflate(payload, expected: int) -> bytes:
     """Inflate without ever producing more than *expected* bytes + 1."""
     obj = zlib.decompressobj()
     raw = obj.decompress(payload, expected + 1)
@@ -161,27 +163,91 @@ def _bounded_inflate(payload: bytes, expected: int) -> bytes:
     return raw
 
 
-def _decode_payload(codec: int, payload: bytes, count: int) -> List[int]:
+def _bounded_inflate_chunks(payload, expected: int, chunk: int = 1 << 20):
+    """Yield inflated pieces of *payload*, never more than *expected* in total.
+
+    Same contract as :func:`_bounded_inflate` but the caller absorbs the output
+    incrementally, so a large stream never exists as one contiguous bytes.
+    """
+    obj = zlib.decompressobj()
+    produced = 0
+    data = payload
+    while True:
+        piece = obj.decompress(data, chunk)
+        if piece:
+            produced += len(piece)
+            if produced > expected:
+                raise ValueError("deflate payload expands beyond declared size")
+            yield piece
+        data = obj.unconsumed_tail
+        if not data:
+            break
+    piece = obj.flush()
+    if piece:
+        produced += len(piece)
+        if produced > expected:
+            raise ValueError("deflate payload expands beyond declared size")
+        yield piece
+    if not obj.eof:
+        raise ValueError("deflate payload expands beyond declared size")
+
+
+# Decoded samples live in a compact C int32 array (4 bytes each) instead of a
+# list of Python ints (~28+ bytes each); 2M samples take 8 MiB, not ~80 MiB.
+_INT32_TYPECODE = "i" if array.array("i").itemsize == 4 else "l"
+
+
+def _int32_array() -> array.array:
+    return array.array(_INT32_TYPECODE)
+
+
+def _int32_array_from_le(data) -> array.array:
+    values = array.array(_INT32_TYPECODE)
+    values.frombytes(data)
+    if sys.byteorder == "big":
+        values.byteswap()
+    return values
+
+
+def _decode_payload_array(codec: int, payload, count: int) -> array.array:
+    """Decode *payload* into a compact int32 array.
+
+    *payload* may be any bytes-like object (a memoryview slice avoids copying
+    it out of the package blob).  The validation rules — and their error
+    messages — are identical to the historical list-returning decoder.
+    """
     if count > MAX_SAMPLES:
         raise ValueError("sample count above decoder limit")
     if codec == CODEC_RAW:
         if len(payload) != count * 4:
             raise ValueError("raw payload length mismatch")
-        return list(struct.unpack(f"<{count}i", payload))
+        return _int32_array_from_le(payload)
     if codec == CODEC_DEFLATE_RAW:
-        raw = _bounded_inflate(payload, count * 4)
-        if len(raw) != count * 4:
+        # Inflate straight into the array in bounded chunks so the raw int32
+        # stream never exists as a second full-size bytes object.
+        values = _int32_array()
+        leftover = bytearray()
+        for piece in _bounded_inflate_chunks(payload, count * 4):
+            leftover += piece
+            aligned = len(leftover) & ~3
+            if aligned:
+                values.frombytes(leftover[:aligned])
+                del leftover[:aligned]
+        if leftover or len(values) != count:
             raise ValueError("deflate payload length mismatch")
-        return list(struct.unpack(f"<{count}i", raw))
+        if sys.byteorder == "big":
+            values.byteswap()
+        return values
     if codec == CODEC_DELTA_VARINT:
         if count == 0:
             if payload:
                 raise ValueError("unexpected payload for empty package")
-            return []
+            return _int32_array()
         if len(payload) < 8:
             raise ValueError("truncated delta payload")
         (first,) = struct.unpack_from("<q", payload, 0)
-        values = [first]
+        values = _int32_array()
+        values.append(first)
         pos = 8
         prev = first
         while len(values) < count:
@@ -196,18 +262,19 @@ def _decode_payload(codec: int, payload: bytes, count: int) -> List[int]:
     if codec == CODEC_DEFLATE_DELTA:
         # Worst case delta stream: first value + first delta + 10 bytes/sample.
         limit = 16 + count * 10
-        return _decode_payload(
+        return _decode_payload_array(
             CODEC_DELTA_VARINT, _bounded_inflate(payload, limit), count
         )
     if codec == CODEC_DELTA2_VARINT:
         if count == 0:
             if payload:
                 raise ValueError("unexpected payload for empty package")
-            return []
+            return _int32_array()
         if len(payload) < 8:
             raise ValueError("truncated delta2 payload")
         (first,) = struct.unpack_from("<q", payload, 0)
-        values = [first]
+        values = _int32_array()
+        values.append(first)
         pos = 8
         prev = first
         prev_delta = 0
@@ -258,8 +325,14 @@ def build_package(
     return head[:-4] + struct.pack("<I", head_crc) + payload
 
 
-def decode_package(blob: bytes) -> dict:
-    """Decode a package and return its values and self-describing metadata."""
+def decode_package_array(blob: bytes) -> dict:
+    """Decode a package; values are a compact int32 :class:`array.array`.
+
+    Memory-frugal counterpart of :func:`decode_package`: the payload is read
+    through a zero-copy view of *blob* and the samples never become a list of
+    Python ints, which keeps a 2M-sample package within a few MiB of decoded
+    state.  Raises the same :class:`ValueError`\\ s for malformed input.
+    """
     if len(blob) < HEADER_SIZE:
         raise ValueError("package shorter than header")
     (
@@ -277,7 +350,7 @@ def decode_package(blob: bytes) -> dict:
         raise ValueError("header crc mismatch")
     if count > MAX_SAMPLES:
         raise ValueError("sample count above decoder limit")
-    payload = blob[HEADER_SIZE:]
+    payload = memoryview(blob)[HEADER_SIZE:]
     if len(payload) != payload_len:
         raise ValueError("payload length mismatch")
     if zlib.crc32(payload) & 0xFFFFFFFF != payload_crc:
@@ -286,7 +359,7 @@ def decode_package(blob: bytes) -> dict:
         raise ValueError("invalid pass interval in header")
     if eps < 0:
         raise ValueError("invalid error limit in header")
-    values = _decode_payload(codec, payload, count)
+    values = _decode_payload_array(codec, payload, count)
     if len(values) != count:
         raise ValueError("decoded sample count mismatch")
     return {
@@ -299,3 +372,10 @@ def decode_package(blob: bytes) -> dict:
         "count": count,
         "bytes": len(blob),
     }
+
+
+def decode_package(blob: bytes) -> dict:
+    """Decode a package and return its values and self-describing metadata."""
+    decoded = decode_package_array(blob)
+    decoded["values"] = decoded["values"].tolist()
+    return decoded

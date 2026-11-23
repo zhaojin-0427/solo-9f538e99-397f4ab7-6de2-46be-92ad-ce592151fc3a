@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import codecs
 import csv
 import io
+import re
 import struct
 import time
 from dataclasses import dataclass
@@ -12,6 +14,16 @@ from typing import List, Sequence
 from . import pack
 
 MAX_CSV_BYTES = 64 * 1024 * 1024
+
+# Uploads are parsed in chunks of this size so a multi-megabyte CSV never has
+# to sit in memory next to its decoded values.
+_CSV_CHUNK_BYTES = 1 << 20
+
+# Cells are delimited by commas or newlines; blank cells are skipped, exactly
+# like the row/column layouts parse_readings accepts.
+_CSV_SPLIT = re.compile(r"[,\n]")
+
+_HEADER_TOKENS = {"value", "gauge", "reading", "轨距"}
 
 
 class InputError(ValueError):
@@ -24,6 +36,21 @@ class Readings:
 
     def __len__(self) -> int:
         return len(self.values)
+
+
+def _parse_token(token: str, index: int) -> int:
+    """One CSV cell → one micrometer reading, or :class:`InputError`."""
+    try:
+        number = int(token, 10)
+    except ValueError:
+        raise InputError(
+            f"sample {index} is not an integer number of micrometers: {token!r}"
+        ) from None
+    if not pack.INT32_MIN <= number <= pack.INT32_MAX:
+        raise InputError(
+            f"sample {index} ({number}) is outside signed 32-bit range"
+        )
+    return number
 
 
 def parse_readings(raw: bytes) -> Readings:
@@ -40,35 +67,23 @@ def parse_readings(raw: bytes) -> Readings:
     except UnicodeDecodeError as exc:
         raise InputError("CSV must be UTF-8") from exc
 
-    tokens: List[str] = []
+    values: List[int] = []
+    first_token = True
     try:
-        rows = list(csv.reader(io.StringIO(text)))
+        # csv.reader is lazy: rows are consumed as they are produced, so the
+        # whole CSV never exists as a list of row lists.
+        for row in csv.reader(io.StringIO(text)):
+            for cell in row:
+                token = cell.strip()
+                if not token:
+                    continue
+                if first_token:
+                    first_token = False
+                    if token.lower() in _HEADER_TOKENS:
+                        continue
+                values.append(_parse_token(token, len(values) + 1))
     except csv.Error as exc:
         raise InputError(f"malformed CSV: {exc}") from exc
-
-    for row in rows:
-        for cell in row:
-            token = cell.strip()
-            if not token:
-                continue
-            tokens.append(token)
-
-    if tokens and tokens[0].lower() in {"value", "gauge", "reading", "轨距"}:
-        tokens = tokens[1:]
-
-    values: List[int] = []
-    for index, token in enumerate(tokens, start=1):
-        try:
-            number = int(token, 10)
-        except ValueError:
-            raise InputError(
-                f"sample {index} is not an integer number of micrometers: {token!r}"
-            ) from None
-        if not pack.INT32_MIN <= number <= pack.INT32_MAX:
-            raise InputError(
-                f"sample {index} ({number}) is outside signed 32-bit range"
-            )
-        values.append(number)
 
     if not values:
         raise InputError("CSV contains no readings")
@@ -78,6 +93,61 @@ def parse_readings(raw: bytes) -> Readings:
             f"{pack.MAX_SAMPLES}"
         )
     return Readings(values)
+
+
+async def read_readings_array(upload, limit: int = MAX_CSV_BYTES):
+    """Stream an uploaded CSV straight into a compact int32 array.
+
+    The upload is read in fixed-size chunks and decoded incrementally, so peak
+    memory stays flat no matter how large the CSV is.  Accepts the same layouts
+    as :func:`parse_readings` and raises the same :class:`InputError`\\ s.
+    """
+    decoder = codecs.getincrementaldecoder("utf-8-sig")()
+    values = pack._int32_array()
+    pending = ""
+    total = 0
+    first_token = True
+
+    def absorb(token: str) -> None:
+        nonlocal first_token
+        token = token.strip()
+        if not token:
+            return
+        if first_token:
+            first_token = False
+            if token.lower() in _HEADER_TOKENS:
+                return
+        index = len(values) + 1
+        if index > pack.MAX_SAMPLES:
+            raise InputError(
+                f"CSV contains {index} readings; the limit is "
+                f"{pack.MAX_SAMPLES}"
+            )
+        values.append(_parse_token(token, index))
+
+    while True:
+        chunk = await upload.read(_CSV_CHUNK_BYTES)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            raise InputError(f"upload exceeds {limit} bytes")
+        try:
+            pending += decoder.decode(chunk)
+        except UnicodeDecodeError:
+            raise InputError("CSV must be UTF-8") from None
+        *tokens, pending = _CSV_SPLIT.split(pending)
+        for token in tokens:
+            absorb(token)
+    try:
+        pending += decoder.decode(b"", final=True)
+    except UnicodeDecodeError:
+        raise InputError("CSV must be UTF-8") from None
+    absorb(pending)
+
+    if not values:
+        raise InputError("CSV contains no readings")
+    return values
 
 
 INT64_MIN = -(2**63)
@@ -109,8 +179,63 @@ class Delivery:
     codec: str
 
 
-def _verdicts(values: Sequence[int], lower: int, upper: int) -> List[str]:
-    return [pack.verdict(v, lower, upper) for v in values]
+def _compare(decoded_values, expected, lower: int, upper: int, eps: int,
+             approximated: bool) -> int:
+    """Check decoded values against the originals, one pass, no copies.
+
+    Raises InputError at the first violated invariant — per-sample error bound
+    or verdict agreement — and confirms the approximation flag matches the
+    actual differences.  Returns the maximum absolute error seen.
+    """
+    verdict = pack.verdict
+    max_error = 0
+    differs = False
+    for index, (original, restored) in enumerate(
+        zip(expected, decoded_values), start=1
+    ):
+        error = restored - original
+        if error < 0:
+            error = -error
+        if error > eps:
+            raise InputError(
+                f"sample {index} error {error} um exceeds limit {eps} um"
+            )
+        if error > max_error:
+            max_error = error
+        if error:
+            differs = True
+        expected_verdict = verdict(original, lower, upper)
+        got_verdict = verdict(restored, lower, upper)
+        if expected_verdict != got_verdict:
+            raise InputError(
+                f"sample {index} verdict changed after decode "
+                f"({expected_verdict} -> {got_verdict})"
+            )
+    if approximated != differs:
+        raise InputError("package approximation flag disagrees with its contents")
+    return max_error
+
+
+def verify_decoded_values(decoded: dict, expected: Sequence[int]) -> dict:
+    """Check already-decoded package values against the original readings.
+
+    Used by /api/inspect: the package is decoded exactly once and both the
+    report and this point-by-point check work on that same batch of values.
+    Raises InputError on any mismatch; returns a summary dict.
+    """
+    values = decoded["values"]
+    if len(values) != len(expected):
+        raise InputError("decoded sample count does not match input")
+    max_error = _compare(
+        values, expected,
+        decoded["lower"], decoded["upper"], decoded["eps"],
+        decoded["approximated"],
+    )
+    return {
+        "max_error": max_error,
+        "approximated": decoded["approximated"],
+        "codec": decoded["codec"],
+    }
 
 
 def verify_package(blob: bytes, expected: Sequence[int], lower: int, upper: int,
@@ -122,7 +247,7 @@ def verify_package(blob: bytes, expected: Sequence[int], lower: int, upper: int,
     pass interval.  Returns a summary dict.
     """
     try:
-        decoded = pack.decode_package(blob)
+        decoded = pack.decode_package_array(blob)
     except (ValueError, pack.PackError) as exc:
         raise InputError(f"package failed to decode: {exc}") from exc
 
@@ -133,28 +258,10 @@ def verify_package(blob: bytes, expected: Sequence[int], lower: int, upper: int,
     if decoded["eps"] != eps:
         raise InputError("package error limit does not match the request")
 
-    max_error = 0
-    expected_verdicts = _verdicts(expected, lower, upper)
-    got_verdicts = _verdicts(decoded["values"], lower, upper)
-    differs = False
-    for index, (original, restored) in enumerate(
-        zip(expected, decoded["values"]), start=1
-    ):
-        error = abs(restored - original)
-        if error > eps:
-            raise InputError(
-                f"sample {index} error {error} um exceeds limit {eps} um"
-            )
-        max_error = max(max_error, error)
-        differs = differs or error != 0
-        if expected_verdicts[index - 1] != got_verdicts[index - 1]:
-            raise InputError(
-                f"sample {index} verdict changed after decode "
-                f"({expected_verdicts[index - 1]} -> {got_verdicts[index - 1]})"
-            )
-    if decoded["approximated"] != differs:
-        raise InputError("package approximation flag disagrees with its contents")
-
+    max_error = _compare(
+        decoded["values"], expected, lower, upper, eps,
+        decoded["approximated"],
+    )
     return {
         "max_error": max_error,
         "approximated": decoded["approximated"],

@@ -12,8 +12,11 @@ Interactive docs (upload forms included) are served at /docs.
 
 from __future__ import annotations
 
+import itertools
+import json
+
 from fastapi import FastAPI, File, Form, UploadFile
-from fastapi.responses import JSONResponse, RedirectResponse, Response
+from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 
 from . import pack, transfer
 
@@ -123,42 +126,94 @@ async def inspect_package(
         description="可选：原始 CSV。提供时逐点核对误差上限与判定一致性",
     ),
 ):
-    blob = await _read_upload(file, MAX_PACKAGE_BYTES)
     try:
-        decoded = pack.decode_package(blob)
+        blob = await _read_upload(file, MAX_PACKAGE_BYTES)
+    finally:
+        # Drop the multipart spool file as soon as the bytes are read: on a
+        # memory-capped container /tmp is tmpfs and counts toward the limit.
+        await file.close()
+    try:
+        # Decoded exactly once; the report below and the point-by-point check
+        # both work on this single batch of values.  Values stay in a compact
+        # int32 array so a 2M-sample package costs ~8 MiB, not ~80.
+        decoded = pack.decode_package_array(blob)
     except (ValueError, pack.PackError) as exc:
         raise transfer.InputError(f"package failed to decode: {exc}") from exc
+    del blob  # the compact array is all the report needs from here on
 
-    report = {
-        "count": decoded["count"],
-        "bytes": decoded["bytes"],
-        "codec": decoded["codec"],
-        "approximated": decoded["approximated"],
-        "pass_interval": {"lower": decoded["lower"], "upper": decoded["upper"]},
-        "error_limit": decoded["eps"],
-        "values": decoded["values"],
-        "verdicts": [
-            pack.verdict(v, decoded["lower"], decoded["upper"])
-            for v in decoded["values"]
-        ],
-        "verdict_labels": [
-            pack.VERDICT_LABELS[
-                pack.verdict(v, decoded["lower"], decoded["upper"])
-            ]
-            for v in decoded["values"]
-        ],
-        "checked_against_original": False,
-    }
-
+    summary = None
     if original is not None:
-        raw = await _read_upload(original, transfer.MAX_CSV_BYTES)
-        readings = transfer.parse_readings(raw)
-        # Raises InputError (400) if an error bound or a verdict differs.
-        summary = transfer.verify_package(
-            blob, readings.values, decoded["lower"], decoded["upper"],
-            decoded["eps"],
-        )
-        report["checked_against_original"] = True
-        report["max_error"] = summary["max_error"]
+        try:
+            expected = await transfer.read_readings_array(original)
+        finally:
+            await original.close()  # release this run's upload staging
+        try:
+            # The whole series is checked before any response bytes leave:
+            # a violation at the very last sample still returns 400.
+            summary = transfer.verify_decoded_values(decoded, expected)
+        finally:
+            del expected  # release this run's staging even on a failed check
 
-    return JSONResponse(content=report)
+    return StreamingResponse(
+        _report_chunks(decoded, summary),
+        media_type="application/json",
+    )
+
+
+_JSON_TRUE = "true"
+_JSON_FALSE = "false"
+
+# Pre-quoted JSON forms of the fixed verdict vocabulary.
+_VERDICT_JSON = {"narrow": '"narrow"', "pass": '"pass"', "wide": '"wide"'}
+_VERDICT_LABEL_JSON = {"narrow": '"偏窄"', "pass": '"合格"', "wide": '"偏宽"'}
+
+# Report arrays are serialised in slices of this many samples, so the JSON
+# body is produced incrementally instead of as one giant string.
+_REPORT_SLICE = 100_000
+
+
+def _joined_slices(items):
+    """Yield comma-joined slices of *items*, keeping array commas balanced."""
+    iterator = iter(items)
+    separator = ""
+    while True:
+        slice_ = list(itertools.islice(iterator, _REPORT_SLICE))
+        if not slice_:
+            return
+        yield separator + ",".join(slice_)
+        separator = ","
+
+
+def _report_chunks(decoded: dict, summary: dict | None):
+    """Stream the inspect report as JSON fragments, in sampling order.
+
+    Field set and order match the historical JSONResponse exactly; the body is
+    just never materialised as one string (2M samples ≈ 40 MB of JSON).
+    """
+    values = decoded["values"]
+    lower, upper = decoded["lower"], decoded["upper"]
+    verdict = pack.verdict
+    yield (
+        f'{{"count":{decoded["count"]},"bytes":{decoded["bytes"]},'
+        f'"codec":{json.dumps(decoded["codec"], ensure_ascii=False)},'
+        f'"approximated":'
+        f'{_JSON_TRUE if decoded["approximated"] else _JSON_FALSE},'
+        f'"pass_interval":{{"lower":{lower},"upper":{upper}}},'
+        f'"error_limit":{decoded["eps"]},"values":['
+    )
+    yield from _joined_slices(str(value) for value in values)
+    yield '],"verdicts":['
+    yield from _joined_slices(
+        _VERDICT_JSON[verdict(value, lower, upper)] for value in values
+    )
+    yield '],"verdict_labels":['
+    yield from _joined_slices(
+        _VERDICT_LABEL_JSON[verdict(value, lower, upper)] for value in values
+    )
+    tail = (
+        f'],"checked_against_original":'
+        f'{_JSON_TRUE if summary is not None else _JSON_FALSE}'
+    )
+    if summary is not None:
+        tail += f',"max_error":{summary["max_error"]}'
+    yield tail + "}"

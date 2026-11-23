@@ -10,3 +10,8 @@ services:
       - /tmp
     security_opt:
       - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          # 复核大包（200 万采样）的内存预算；实现按此上限优化。
+          memory: 128M

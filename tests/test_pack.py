@@ -5,6 +5,88 @@ import unittest
 from app import pack, transfer
 
 
+class ArrayDecodeTests(unittest.TestCase):
+    def test_array_decode_matches_list_decode(self):
+        import array as array_mod
+
+        values = [1435000, 1435001, 1435003, 1435003, 1434998, 1435002, -7]
+        for codec in pack.ALL_CODECS:
+            payload = pack.encode_payload(codec, values)
+            blob = pack.build_package(codec, 0, values, payload, 1000, 2000, 5)
+            decoded = pack.decode_package_array(blob)
+            self.assertIsInstance(decoded["values"], array_mod.array, codec)
+            self.assertEqual(decoded["values"].tolist(), values, codec)
+            self.assertEqual(
+                pack.decode_package(blob)["values"], values, codec
+            )
+
+    def test_array_decode_empty_and_single(self):
+        for values in ([], [7]):
+            for codec in pack.ALL_CODECS:
+                payload = pack.encode_payload(codec, values)
+                blob = pack.build_package(codec, 0, values, payload, 0, 10, 1)
+                decoded = pack.decode_package_array(blob)
+                self.assertEqual(decoded["values"].tolist(), values, codec)
+
+    def test_array_decode_rejects_corruption(self):
+        values = list(range(1000))
+        payload = pack.encode_payload(pack.CODEC_DEFLATE_RAW, values)
+        blob = pack.build_package(
+            pack.CODEC_DEFLATE_RAW, 0, values, payload, 0, 2000, 0
+        )
+        broken = bytearray(blob)
+        broken[-1] ^= 0xFF
+        with self.assertRaises(ValueError):
+            pack.decode_package_array(bytes(broken))
+
+    def test_streaming_csv_parser_matches_parse_readings(self):
+        import asyncio
+
+        class FakeUpload:
+            def __init__(self, data, chunk):
+                self._data = data
+                self._chunk = chunk
+                self._pos = 0
+
+            async def read(self, _size):
+                if self._pos >= len(self._data):
+                    return b""
+                piece = self._data[self._pos : self._pos + self._chunk]
+                self._pos += self._chunk
+                return piece
+
+        cases = [
+            b"100\n200\n\n300\n",
+            b"value,100,200,300\n",
+            b"\xef\xbb\xbf1\n2\n3\n",          # UTF-8 BOM
+            b"1\r\n2\r\n3\r\n",                # CRLF
+            "轨距\n1\n2\n".encode(),           # header row is skipped
+            b"7",                              # no trailing newline
+        ]
+        for raw in cases:
+            expected = transfer.parse_readings(raw).values
+            for chunk in (1, 3, 1024):
+                got = asyncio.run(
+                    transfer.read_readings_array(FakeUpload(raw, chunk))
+                )
+                self.assertEqual(got.tolist(), expected, (raw, chunk))
+
+    def test_streaming_csv_parser_rejects_bad_input(self):
+        import asyncio
+
+        class FakeUpload:
+            def __init__(self, data):
+                self._data = data
+
+            async def read(self, _size):
+                data, self._data = self._data, b""
+                return data
+
+        for raw in (b"100\n1.5\n", b"99999999999\n", b"\n\n", b"\xff\xfe"):
+            with self.assertRaises(transfer.InputError):
+                asyncio.run(transfer.read_readings_array(FakeUpload(raw)))
+
+
 class VerdictTests(unittest.TestCase):
     def test_inclusive_interval(self):
         self.assertEqual(pack.verdict(1000, 1000, 2000), "pass")
